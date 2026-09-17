@@ -1,6 +1,8 @@
 name: Weekly status refresh
 
 on:
+  schedule:
+    - cron: "0 16 * * 1"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -31,7 +33,6 @@ jobs:
     env:
       PYTHONUNBUFFERED: "1"
       YOUWARD_SLACK_WEBHOOK: ${{ secrets.YOUWARD_SLACK_WEBHOOK }}
-      LIVE_ENABLED: ${{ vars.STATUS_REFRESH_LIVE_ENABLED }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           dry_run=true
-          if [[ "$EVENT_NAME" == "schedule" && "$LIVE_ENABLED" == "true" ]]; then
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
             dry_run=false
           elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$REQUESTED_DRY_RUN" == "false" ]]; then
             if [[ -z "$LIVE_APPROVAL" ]]; then
