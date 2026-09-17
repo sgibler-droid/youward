@@ -1,0 +1,6 @@
+{
+  "record_count": 199,
+  "allowed_status_changes": 39,
+  "blocked_status_changes": 40,
+  "threshold": 0.20
+}
