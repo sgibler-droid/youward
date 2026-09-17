@@ -1,0 +1,145 @@
+name: Weekly status refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Compute and report only; never commit"
+        required: true
+        default: true
+        type: boolean
+      live_approval:
+        description: "Required Slack S→A receipt for a manual live commit"
+        required: false
+        type: string
+      breaker_clearance:
+        description: "Required #youward human-clearance receipt to override the >20% circuit breaker"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youward-weekly-status-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PYTHONUNBUFFERED: "1"
+      YOUWARD_SLACK_WEBHOOK: ${{ secrets.YOUWARD_SLACK_WEBHOOK }}
+      LIVE_ENABLED: ${{ vars.STATUS_REFRESH_LIVE_ENABLED }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve dry-run gate
+        id: mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_DRY_RUN: ${{ inputs.dry_run }}
+          LIVE_APPROVAL: ${{ inputs.live_approval }}
+        run: |
+          set -euo pipefail
+          dry_run=true
+          if [[ "$EVENT_NAME" == "schedule" && "$LIVE_ENABLED" == "true" ]]; then
+            dry_run=false
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && "$REQUESTED_DRY_RUN" == "false" ]]; then
+            if [[ -z "$LIVE_APPROVAL" ]]; then
+              echo "::error::Manual live run requires a Slack S→A approval receipt."
+              exit 2
+            fi
+            dry_run=false
+          fi
+          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
+          echo "Mode: dry_run=$dry_run"
+
+      - name: Run deterministic fixtures
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Refresh all 199 records
+        id: refresh
+        shell: bash
+        env:
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+          BREAKER_CLEARANCE: ${{ inputs.breaker_clearance }}
+        run: |
+          set -uo pipefail
+          mkdir -p artifacts
+          args=(
+            --html index.html
+            --out artifacts/index.next.html
+            --ledger artifacts/status-ledger.json
+            --receipt artifacts/status-receipt.json
+          )
+          if [[ "$DRY_RUN" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          if [[ -n "$BREAKER_CLEARANCE" ]]; then
+            args+=(--breaker-clearance "$BREAKER_CLEARANCE")
+          fi
+          set +e
+          python3 scripts/verify-status.py "${args[@]}" 2>&1 | tee artifacts/run.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          if [[ "$rc" -ne 0 && "$rc" -ne 42 ]]; then
+            exit "$rc"
+          fi
+          if [[ -f artifacts/index.next.html ]]; then
+            git diff --no-index -- index.html artifacts/index.next.html > artifacts/status.diff || true
+          else
+            : > artifacts/status.diff
+          fi
+
+      - name: P44 leak gate on page and captured workflow output
+        if: always() && hashFiles('artifacts/status-receipt.json') != ''
+        run: |
+          page=index.html
+          if [[ -f artifacts/index.next.html ]]; then page=artifacts/index.next.html; fi
+          python3 scripts/p44-leak-gate.py "$page" artifacts/run.log artifacts/status.diff
+
+      - name: Stop on circuit breaker after reporting
+        if: steps.refresh.outputs.exit_code == '42'
+        env:
+          RECEIPT: artifacts/status-receipt.json
+        run: |
+          python3 scripts/post-slack-receipt.py "$RECEIPT"
+          echo "::error::Circuit breaker stopped this run. Human clearance in #youward is required."
+          exit 42
+
+      - name: Commit live refresh with receipt line
+        if: steps.refresh.outputs.exit_code == '0' && steps.mode.outputs.dry_run == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp artifacts/index.next.html index.html
+          changed="$(git diff --name-only)"
+          if [[ -n "$changed" && "$changed" != "index.html" ]]; then
+            echo "::error::Live refresh attempted to change files outside index.html."
+            exit 4
+          fi
+          receipt="$(python3 -c 'import json; print(json.load(open("artifacts/status-receipt.json"))["receipt_line"])')"
+          git config user.name "youward-status-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add index.html
+          git commit --allow-empty -m "$receipt"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Post one-line receipt to #youward
+        if: steps.refresh.outputs.exit_code == '0'
+        run: python3 scripts/post-slack-receipt.py artifacts/status-receipt.json
+
+      - name: Upload dry-run and audit artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-refresh-${{ github.run_id }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 30

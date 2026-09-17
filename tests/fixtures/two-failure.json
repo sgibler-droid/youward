@@ -1,0 +1,7 @@
+{
+  "prior_status": "open",
+  "prior_evidence": "official source | checked 2026-09-14 | accepting applications",
+  "failure_evidence": "https://example.org/program | checked 2026-09-21 | fetch returned 503",
+  "expected_first_status": "open",
+  "expected_second_status": "unverified"
+}
